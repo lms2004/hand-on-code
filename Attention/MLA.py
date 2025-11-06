@@ -1,121 +1,172 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+DeepSeek-V2 MLA Demo — 带公式注释版本
+验证 MLA 的低秩压缩 + 解耦 RoPE
+"""
+
 import torch
-import torch.nn as nn
-import math
-class RotaryEmbedding(nn.Module):
-    def __init__(self, hidden_size, num_heads, base=10000, max_len=512):
-        """
-        RoPE位置编码模块
+import torch.nn.functional as F
 
-        Args:
-            hidden_size (int): 模型维度
-            num_heads (int): 注意力头数量
-            base (int): 频率基值
-            max_len (int): 最大序列长度
-        """
+
+# =======================================
+# 🔹 RoPE 旋转函数
+# 公式:  RoPE(x) = x·cosθ + rotate(x)·sinθ
+# =======================================
+def apply_rope_x(x, cos, sin):
+    """
+    x: [B, H, L, D]
+    cos/sin: [1, 1, L, D]
+    """
+    x1, x2 = x[..., ::2], x[..., 1::2]
+    x_rot = torch.stack([-x2, x1], dim=-1).reshape_as(x)
+    return x * cos + x_rot * sin
+
+
+# =======================================
+# 🔹 MLA 模块（DeepSeek-V2 实现）
+# =======================================
+class MLA(torch.nn.Module):
+    def __init__(self, d_model, n_heads, max_len=1024, rope_theta=10000.0):
         super().__init__()
-        self.head_dim = hidden_size // num_heads
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.base = base
-        self.max_len = max_len
-        self.cos_pos_cache, self.sin_pos_cache = self._compute_pos_emb()
-    def _compute_pos_emb(self):
-        theta_i = 1. / (self.base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
-        positions = torch.arange(self.max_len)
-        pos_emb = positions.unsqueeze(1) * theta_i.unsqueeze(0)
-        cos_pos = pos_emb.sin().repeat_interleave(2, dim=-1)
-        sin_pos = pos_emb.cos().repeat_interleave(2, dim=-1)
-        return cos_pos, sin_pos
-    def forward(self, q):
-        """
-        RoPE位置编码应用
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.dh = d_model // n_heads
+        self.q_proj_dim = d_model // 2           # ↓ 公式 (W^{DQ})
+        self.kv_proj_dim = (2 * d_model) // 3    # ↓ 公式 (W^{DKV})
 
-        Args:
-            q (torch.Tensor): 输入张量 [bs, num_heads, seq_len, head_dim]
+        # 每个 head 的拆分维度
+        self.qk_nope_dim = self.dh // 2   # 不带 RoPE 的部分
+        self.qk_rope_dim = self.dh // 2   # 带 RoPE 的部分
 
-        Returns:
-            torch.Tensor: 应用位置编码后的张量
+        # ===== Q 投影层 =====
+        # 公式:  c_t^Q = W^{DQ} h_t
+        self.W_dq = torch.nn.Parameter(0.01 * torch.randn((d_model, self.q_proj_dim)))
+        # 公式:  q_t^C = W^{UQ} c_t^Q
+        self.W_uq = torch.nn.Parameter(0.01 * torch.randn((self.q_proj_dim, d_model)))
+        self.q_layernorm = torch.nn.LayerNorm(self.q_proj_dim)
+
+        # ===== KV 投影层 =====
+        # 公式:  c_t^{KV} = W^{DKV} h_t
+        self.W_dkv = torch.nn.Parameter(0.01 * torch.randn((d_model, self.kv_proj_dim + self.qk_rope_dim)))
+        # 公式:  [K^C, V^C] = W^{UKV} c_t^{KV}
+        self.W_ukv = torch.nn.Parameter(
+            0.01 * torch.randn((self.kv_proj_dim, d_model + (n_heads * self.qk_nope_dim)))
+        )
+        self.kv_layernorm = torch.nn.LayerNorm(self.kv_proj_dim)
+
+        # 输出投影:  u_t = W^O [o_{t,1};…;o_{t,n_h}]
+        self.W_o = torch.nn.Parameter(0.01 * torch.randn((d_model, d_model)))
+
+        # ===== RoPE 缓存 =====
+        freqs = 1.0 / (rope_theta ** (torch.arange(0, self.dh, 2).float() / self.dh))
+        emb = torch.outer(torch.arange(max_len).float(), freqs)
+        cos_cached = emb.cos()[None, None, :, :]
+        sin_cached = emb.sin()[None, None, :, :]
+        self.register_buffer("cos_cached", cos_cached)
+        self.register_buffer("sin_cached", sin_cached)
+
+    # =======================================
+    # 前向传播
+    # =======================================
+    def forward(self, x, kv_cache=None, past_length=0):
         """
-        bs, seq_len = q.shape[0], q.shape[2]
-        cos_pos = self.cos_pos_cache[:seq_len].to(q.device)  # [seq_len, head_dim]
-        sin_pos = self.sin_pos_cache[:seq_len].to(q.device)  # [seq_len, head_dim]
-        # 扩展维度以匹配batch和head维度
-        cos_pos = cos_pos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, head_dim]
-        sin_pos = sin_pos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, head_dim]
-        # RoPE变换
-        q2 = torch.stack([-q[..., 1::2], q[..., ::2]], dim=-1)  # 奇偶交替
-        q2 = q2.reshape(q.shape).contiguous()
-        return q * cos_pos + q2 * sin_pos
-class MultiHeadLatentAttention(nn.Module):
-    def __init__(self, hidden_size=256, down_dim=64, up_dim=128, num_heads=8, rope_head_dim=26, dropout_prob=0.0):
+        输入:  x ∈ ℝ^{B×S×d_model}
+        输出:  u_t, c^{KV}
         """
-        Args:
-            down_dim (int): 降维后的维度
-            up_dim (int): 升维后的维度
-            rope_head_dim (int): RoPE编码的头维度
-        """
-        super(MultiHeadLatentAttention, self).__init__()
-        self.d_model = hidden_size
-        self.down_dim = down_dim
-        self.up_dim = up_dim
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        self.rope_head_dim = rope_head_dim
-        self.v_head_dim = up_dim // num_heads
-        # 降维投影
-        self.down_proj_kv = nn.Linear(hidden_size, down_dim)
-        self.down_proj_q = nn.Linear(hidden_size, down_dim)
-        # 升维投影
-        self.up_proj_k = nn.Linear(down_dim, up_dim)
-        self.up_proj_v = nn.Linear(down_dim, up_dim)
-        self.up_proj_q = nn.Linear(down_dim, up_dim)
-        # 解耦Q/K投影
-        self.proj_qr = nn.Linear(down_dim, rope_head_dim * num_heads)
-        self.proj_kr = nn.Linear(hidden_size, rope_head_dim)
-        # RoPE位置编码
-        self.rope_q = RotaryEmbedding(rope_head_dim * num_heads, num_heads)
-        self.rope_k = RotaryEmbedding(rope_head_dim, 1)
-        # 输出层
-        self.dropout = nn.Dropout(dropout_prob)
-        self.fc = nn.Linear(num_heads * self.v_head_dim, hidden_size)
-        self.res_dropout = nn.Dropout(dropout_prob)
-    def forward(self, h, mask=None):
-        bs, seq_len, _ = h.size()
-        # Step 1: 低秩转换
-        c_t_kv = self.down_proj_kv(h)  # [bs, seq_len, down_dim]
-        k_t_c = self.up_proj_k(c_t_kv)  # [bs, seq_len, up_dim]
-        v_t_c = self.up_proj_v(c_t_kv)  # [bs, seq_len, up_dim]
-        c_t_q = self.down_proj_q(h)  # [bs, seq_len, down_dim]
-        q_t_c = self.up_proj_q(c_t_q)  # [bs, seq_len, up_dim]
-        # Step 2: 解耦Q/K处理
-        # RoPE投影处理
-        q_t_r = self.proj_qr(c_t_q)  # [bs, seq_len, rope_head_dim*num_heads]
-        q_t_r = q_t_r.view(bs, seq_len, self.num_heads, self.rope_head_dim).transpose(1, 2)  # [bs, num_heads, seq_len, rope_head_dim]
-        q_t_r = self.rope_q(q_t_r)  # 应用RoPE编码
-        k_t_r = self.proj_kr(h)  # [bs, seq_len, rope_head_dim]
-        k_t_r = k_t_r.unsqueeze(1)  # [bs, 1, seq_len, rope_head_dim]
-        k_t_r = self.rope_k(k_t_r)  # 应用RoPE编码
-        # Step 3: 注意力计算
-        # Q/K/V维度调整
-        q_t_c = q_t_c.view(bs, seq_len, self.num_heads, -1).transpose(1, 2)  # [bs, num_heads, seq_len, up_dim/num_heads]
-        q = torch.cat([q_t_c, q_t_r], dim=-1)  # [bs, num_heads, seq_len, (up_dim+rope_head_dim)/num_heads]
-        k_t_c = k_t_c.view(bs, seq_len, self.num_heads, -1).transpose(1, 2)  # [bs, num_heads, seq_len, up_dim/num_heads]
-        k_t_r = k_t_r.expand(bs, self.num_heads, seq_len, -1)  # [bs, num_heads, seq_len, rope_head_dim]
-        k = torch.cat([k_t_c, k_t_r], dim=-1)  # [bs, num_heads, seq_len, (up_dim+rope_head_dim)/num_heads]
-        # 计算注意力权重
-        scores = torch.matmul(q, k.transpose(-1, -2))  # [bs, num_heads, seq_len, seq_len]
-        scores = scores / (math.sqrt(self.head_dim) + math.sqrt(self.rope_head_dim))
-        if mask is not None:
-            scores = scores.masked_fill(mask[:, None, None, :] == 0, float('-inf'))  # [bs, num_heads, seq_len, seq_len]
-        attn_weights = torch.softmax(scores, dim=-1)  # [bs, num_heads, seq_len, seq_len]
-        attn_weights = self.dropout(attn_weights)
-        # V维度调整
-        v_t_c = v_t_c.view(bs, seq_len, self.num_heads, self.v_head_dim).transpose(1, 2)  # [bs, num_heads, seq_len, v_head_dim]
-        # 计算上下文向量
-        context = torch.matmul(attn_weights, v_t_c)  # [bs, num_heads, seq_len, v_head_dim]
-        # 合并多头
-        context = context.transpose(1, 2).contiguous().view(bs, seq_len, -1)  # [bs, seq_len, num_heads*v_head_dim]
-        # 输出投影
-        output = self.fc(context)  # [bs, seq_len, d_model]
-        output = self.res_dropout(output)
-        return output
+        B, S, D = x.size()
+
+        # -------------------------------------------------
+        # Step1️⃣ KV 低秩压缩
+        # -------------------------------------------------
+        # 公式:  c_j^{KV} = W^{DKV} h_j
+        if kv_cache is None:
+            compressed_kv = x @ self.W_dkv
+            # 拆分:  KV_for_lora → c^{KV};  K_for_rope → RoPE部分
+            KV_for_lora, K_for_rope = torch.split(compressed_kv,
+                                                  [self.kv_proj_dim, self.qk_rope_dim], dim=-1)
+            KV_for_lora = self.kv_layernorm(KV_for_lora)
+        else:
+            # 推理阶段: 拼接旧缓存
+            new_kv = x @ self.W_dkv
+            compressed_kv = torch.cat([kv_cache, new_kv], dim=1)
+            new_kv, new_K_for_rope = torch.split(new_kv, [self.kv_proj_dim, self.qk_rope_dim], dim=-1)
+            old_kv, old_K_for_rope = torch.split(kv_cache, [self.kv_proj_dim, self.qk_rope_dim], dim=-1)
+            new_kv = self.kv_layernorm(new_kv)
+            old_kv = self.kv_layernorm(old_kv)
+            KV_for_lora = torch.cat([old_kv, new_kv], dim=1)
+            K_for_rope = torch.cat([old_K_for_rope, new_K_for_rope], dim=1)
+
+        # -------------------------------------------------
+        # Step2️⃣ 低秩恢复 Key/Value
+        # -------------------------------------------------
+        # 公式:  [K^C, V^C] = W^{UKV} c^{KV}
+        KV = KV_for_lora @ self.W_ukv
+        KV = KV.view(B, -1, self.n_heads, self.dh + self.qk_nope_dim).transpose(1, 2)
+        # 拆分:  K^C, V^C
+        K, V = torch.split(KV, [self.qk_nope_dim, self.dh], dim=-1)
+        S_full = K.size(2)
+
+        # -------------------------------------------------
+        # Step3️⃣ 计算 RoPE Key
+        # -------------------------------------------------
+        # 公式:  k_j^R = RoPE(W^{KR} h_j)
+        K_for_rope = K_for_rope.view(B, -1, 1, self.qk_rope_dim).transpose(1, 2)
+        cos_k = self.cos_cached[:, :, :S_full, :self.qk_rope_dim // 2].repeat(1, 1, 1, 2)
+        sin_k = self.sin_cached[:, :, :S_full, :self.qk_rope_dim // 2].repeat(1, 1, 1, 2)
+        K_for_rope = apply_rope_x(K_for_rope, cos_k, sin_k)
+        K_for_rope = K_for_rope.repeat(1, self.n_heads, 1, 1)
+
+        # -------------------------------------------------
+        # Step4️⃣ 计算 Query（含解耦 RoPE）
+        # -------------------------------------------------
+        # (a) 压缩:  c_t^Q = W^{DQ} h_t
+        compressed_q = x @ self.W_dq
+        compressed_q = self.q_layernorm(compressed_q)
+        # (b) 恢复:  q_t^C = W^{UQ} c_t^Q
+        Q = compressed_q @ self.W_uq
+        Q = Q.view(B, -1, self.n_heads, self.dh).transpose(1, 2)
+        # (c) 拆分:  Q=[Q_nope, Q_rope]
+        Q, Q_for_rope = torch.split(Q, [self.qk_nope_dim, self.qk_rope_dim], dim=-1)
+        # (d) 加 RoPE:  q_t^R = RoPE(W^{QR} c_t^Q)
+        cos_q = self.cos_cached[:, :, past_length:past_length + S, :self.qk_rope_dim // 2].repeat(1, 1, 1, 2)
+        sin_q = self.sin_cached[:, :, past_length:past_length + S, :self.qk_rope_dim // 2].repeat(1, 1, 1, 2)
+        Q_for_rope = apply_rope_x(Q_for_rope, cos_q, sin_q)
+
+        # -------------------------------------------------
+        # Step5️⃣ 拼接解耦分支
+        # -------------------------------------------------
+        # 公式:  q_t = [q_t^C ; q_t^R],  k_j = [k_j^C ; k_j^R]
+        q_heads = torch.cat([Q, Q_for_rope], dim=-1)
+        k_heads = torch.cat([K, K_for_rope], dim=-1)
+        v_heads = V
+
+        # -------------------------------------------------
+        # Step6️⃣ 注意力打分与加权
+        # -------------------------------------------------
+        # 公式:  α_{t,j} = softmax_j( (q_t k_j^T)/√(d_h+d_h^R) )
+        mask = torch.ones((S, S_full), device=x.device)
+        mask = torch.tril(mask, diagonal=past_length)
+        sq_mask = mask[None, None, :, :] == 1
+        x_out = F.scaled_dot_product_attention(q_heads, k_heads, v_heads, attn_mask=sq_mask)
+        # 公式:  o_t = Σ_j α_{t,j} v_j^C
+        x_out = x_out.transpose(1, 2).reshape(B, S, D)
+        # 输出:  u_t = W^O [o_{t,1};…;o_{t,n_h}]
+        x_out = x_out @ self.W_o.T
+
+        return x_out, compressed_kv
+
+
+# =======================================
+# 🔹 调试入口
+# =======================================
+def main():
+    torch.manual_seed(42)
+    d_model, n_heads, seq_len, batch = 256, 8, 8, 2
+    model = MLA(d_model=d_model, n_heads=n_heads, max_len=128)
+    x = torch.randn(batch, seq_len, d_model)
+    out, kv = model(x)
+    print(f"✅ 输入: {x.shape} → 输出: {out.shape}, 缓存: {kv.shape}")
+
+if __name__ == "__main__":
+    main()
