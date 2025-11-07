@@ -1,126 +1,157 @@
-# 从 LlamaAttention 修改而来，适配 DeepseekV2 模型的注意力模块，简单版本不带 kv cache
-class DeepseekV2MLA(nn.Module):
-    def __init__(self, config: DeepseekV2Config):
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+DeepSeek-V2 MLA Demo — 行内公式注释版（完整版）
+验证 MLA 的低秩键值压缩 + 解耦 RoPE
+作者：ChatGPT (GPT-5)
+"""
+
+import torch
+import torch.nn.functional as F
+
+
+# =========================================================
+# 🔹 RoPE 旋转函数
+# 公式: RoPE(x) = x·cosθ + rotate(x)·sinθ
+# =========================================================
+def apply_rope_x(x, cos, sin):
+    x1, x2 = x[..., ::2], x[..., 1::2]                            # 拆分偶/奇维度 → x=[x₁, x₂]
+    x_rot = torch.stack([-x2, x1], dim=-1).reshape_as(x)          # rotate(x) = [-x₂, x₁]
+    return x * cos + x_rot * sin                                  # 式(R): RoPE(x)=x·cosθ+rotate(x)·sinθ
+
+
+# =========================================================
+# 🔹 MLA 模块
+# =========================================================
+class MLA(torch.nn.Module):
+    def __init__(self, d_model, n_heads, max_len=1024, rope_theta=10000.0):
         super().__init__()
-        # MHA 初始化相关
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.v_head_dim = config.v_head_dim
+        self.d_model = d_model                                     # 模型维度 d_model
+        self.n_heads = n_heads                                     # 注意力头数 n_h
+        self.dh = d_model // n_heads                               # 每个 head 的维度 d_h
 
-        self.o_proj = nn.Linear(
-            self.v_head_dim * self.num_heads, 
-            self.hidden_size,
-            bias=config.attention_bias,
-        )
+        self.q_proj_dim = d_model // 2                             # 式(QD): c_t^{Q} = W^{DQ} h_t
+        self.kv_proj_dim = (2 * d_model) // 3                      # 式(9):  c_t^{KV} = W^{DKV} h_t
 
-        self.attention_dropout = config.attention_dropout
-        self.training = False
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_nope_dim = self.dh // 2                            # 不带RoPE部分 → q_t^{C}, k_j^{C}
+        self.qk_rope_dim = self.dh // 2                            # 带RoPE部分 → q_t^{R}, k_j^{R}
 
-        # MLA 相关 part1: 压缩
-        self.q_lora_rank = config.q_lora_rank
-        self.kv_lora_rank = config.kv_lora_rank
+        # ===== Q投影 =====
+        self.W_dq = torch.nn.Parameter(0.01 * torch.randn((d_model, self.q_proj_dim)))   # 式(QD): 低秩压缩矩阵 W^{DQ}
+        self.W_uq = torch.nn.Parameter(0.01 * torch.randn((self.q_proj_dim, d_model)))   # 式(QU): 低秩恢复矩阵 W^{UQ}
+        self.q_layernorm = torch.nn.LayerNorm(self.q_proj_dim)                           # LayerNorm(c_t^{Q})
 
-        self.q_down_proj = nn.Linear(self.hidden_size, self.q_lora_rank)
-        self.q_down_rmsnorm = DeepseekV2RMSNorm(self.q_lora_rank)
-        
-        self.kv_down_proj = nn.Linear(
-            self.hidden_size, 
-            self.kv_lora_rank + config.qk_rope_head_dim
-        )
-        self.kv_down_rmsnorm = DeepseekV2RMSNorm(self.kv_lora_rank)
-        
-        # MLA 相关 part2: 解压缩. # W^{WQ} 和 W^{QR} 权重是合并再一起的。
-        self.qk_head_dim = self.qk_nope_head_dim  + self.qk_rope_head_dim
-        self.q_up_proj = nn.Linear(
-            self.q_lora_rank, 
-            self.num_heads * self.qk_head_dim,
-            bias=False,
-        )
-        
-        self.kv_up_proj = nn.Linear(
-            self.kv_lora_rank, 
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-        )
-        
-        # MLA 相关 part3: 切片 q k 张量，以及 rope 旋转位置编码
-        self.rotary_emb = DeepseekV2RotaryEmbedding(
-            config.qk_rope_head_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
-        ) 
+        # ===== KV投影 =====
+        self.W_dkv = torch.nn.Parameter(0.01 * torch.randn((d_model, self.kv_proj_dim + self.qk_rope_dim)))  
+        # 式(9): [c_t^{KV}, k_{raw,t}^{R}] = W^{DKV} h_t
 
-    def forward(self, hidden_states, position_ids, casual_mask=None):
-        batch_size, q_len, hidden_size = hidden_states.shape
+        self.W_ukv = torch.nn.Parameter(
+            0.01 * torch.randn((self.kv_proj_dim, d_model + (n_heads * self.qk_nope_dim)))
+        )  # 式(10)+(11): [K^{C}, V^{C}] = W^{UKV} c_t^{KV}
+        self.kv_layernorm = torch.nn.LayerNorm(self.kv_proj_dim)    # ˆc_t^{KV} = LayerNorm(c_t^{KV})
 
-        # 1，q 压缩和解压缩，以及 split to q_nope, q_rope
-        q = self.q_up_proj(
-            self.q_down_rmsnorm(self.q_down_proj(hidden_states))
-        )
+        # ===== 输出投影 =====
+        self.W_o = torch.nn.Parameter(0.01 * torch.randn((d_model, d_model)))            # 式(U): u_t = W^{O} o_t
 
-        q = q.view(batch_size, q_len, self.num_heads, self.qk_head_dim).transpose(1,2)
-        q_nope, q_rope = torch.split(
-            q,
-            [self.qk_nope_head_dim, self.qk_rope_head_dim],
-            dim = -1,
-        )
+        # ===== RoPE 缓存 =====
+        freqs = 1.0 / (rope_theta ** (torch.arange(0, self.dh, 2).float() / self.dh))    # θ_i = θ^{-2i/d_h}
+        emb = torch.outer(torch.arange(max_len).float(), freqs)                          # θ_{pos,i} = pos * freq_i
+        cos_cached = emb.cos()[None, None, :, :]                                         # cosθ
+        sin_cached = emb.sin()[None, None, :, :]                                         # sinθ
+        self.register_buffer("cos_cached", cos_cached)
+        self.register_buffer("sin_cached", sin_cached)
 
-        # 2, kv 压缩和解压缩
-        kv_down = self.kv_down_proj(hidden_states)
-        
-        # compressed_kv 压缩后的 kv 张量
-        compressed_kv, k_rope = torch.split(
-            kv_down,
-            [self.kv_lora_rank, self.qk_rope_head_dim],
-            dim = -1,
-        )
-        # num_heads = 1 后续广播其它 heads 上
-        k_rope = k_rope.view(batch_size, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+    # =========================================================
+    # 🔹 前向传播
+    # =========================================================
+    def forward(self, x, kv_cache=None, past_length=0):
+        B, S, D = x.size()                                                              # 输入 h_t ∈ ℝ^{B×S×d_model}
 
-        # 对 compressed_kv 解压缩
-        kv = (
-            self.kv_up_proj(self.kv_down_rmsnorm(compressed_kv))
-            .view(batch_size, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            .transpose(1, 2)
-        )
+        # -----------------------------------------------------
+        # Step1️⃣ KV 低秩压缩
+        # 式(9): [c_t^{KV}, k_{raw,t}^{R}] = W^{DKV} h_t
+        # -----------------------------------------------------
+        if kv_cache is None:
+            compressed_kv = x @ self.W_dkv                                              # 式(9): 计算 W^{DKV} h_t
+            KV_for_lora, K_for_rope = torch.split(compressed_kv, [self.kv_proj_dim, self.qk_rope_dim], dim=-1)
+            KV_for_lora = self.kv_layernorm(KV_for_lora)                                # ˆc_t^{KV} = LN(c_t^{KV})
+        else:
+            new_kv = x @ self.W_dkv                                                     # 式(9): 当前 token 的 [c_t^{KV}, k_{raw,t}^{R}]
+            compressed_kv = torch.cat([kv_cache, new_kv], dim=1)                        # 拼接缓存 → [c_{1:t}^{KV}, k_{raw,1:t}^{R}]
+            new_kv, new_Kr = torch.split(new_kv, [self.kv_proj_dim, self.qk_rope_dim], dim=-1)
+            old_kv, old_Kr = torch.split(kv_cache, [self.kv_proj_dim, self.qk_rope_dim], dim=-1)
+            new_kv = self.kv_layernorm(new_kv)                                          # ˆc_t^{KV}
+            old_kv = self.kv_layernorm(old_kv)                                          # ˆc_{1:t-1}^{KV}
+            KV_for_lora = torch.cat([old_kv, new_kv], dim=1)                            # 拼接低秩潜向量序列
+            K_for_rope = torch.cat([old_Kr, new_Kr], dim=1)                             # 拼接RoPE原始键分支
 
-        k_nope, value_states = torch.split(
-            kv,
-            [self.qk_nope_head_dim, self.v_head_dim],
-            dim = -1,
-        )
+        # -----------------------------------------------------
+        # Step2️⃣ 从低秩潜向量恢复 Key/Value
+        # 式(10) + (11): [K^{C}, V^{C}] = W^{UKV} c^{KV}
+        # -----------------------------------------------------
+        KV = KV_for_lora @ self.W_ukv                                                   # 应用恢复矩阵 W^{UKV}
+        KV = KV.view(B, -1, self.n_heads, self.dh + self.qk_nope_dim).transpose(1, 2)   # reshape成[B,nH,S,dh+dh_nope]
+        K, V = torch.split(KV, [self.qk_nope_dim, self.dh], dim=-1)                     # 分得 K^{C}, V^{C}
+        S_full = K.size(2)                                                              # 全序列长度（含历史）
 
-        # 3, 计算 cos 和 sin，并应用 rope 旋转位置编码
-        kv_seq_len = value_states.shape[-2] # shape (b, nums_head, seq_len, v_head_dim)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        
-        q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, cos, sin, position_ids)
+        # -----------------------------------------------------
+        # Step3️⃣ 计算 RoPE 键分支
+        # 式(R): k_j^{R} = RoPE(k_{raw,j}^{R})
+        # -----------------------------------------------------
+        K_for_rope = K_for_rope.view(B, -1, 1, self.qk_rope_dim).transpose(1, 2)        # [B,1,S_full,D_rope]
+        cos_k = self.cos_cached[:, :, :S_full, :self.qk_rope_dim // 2].repeat(1, 1, 1, 2)
+        sin_k = self.sin_cached[:, :, :S_full, :self.qk_rope_dim // 2].repeat(1, 1, 1, 2)
+        K_for_rope = apply_rope_x(K_for_rope, cos_k, sin_k)                             # k_j^{R} = RoPE(k_{raw,j}^{R})
+        K_for_rope = K_for_rope.repeat(1, self.n_heads, 1, 1)                           # 复制到所有 head
 
-        # 4, 执行 self-attention 计算
-        query_states = torch.concat([q_nope, q_rope], dim=-1)
-        key_states = torch.concat(
-            [k_nope, k_rope.expand(-1, self.num_heads, -1, -1)], 
-            dim=-1
-        )
-        # qk^t
-        scores = (
-            torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.qk_head_dim)
-        )
+        # -----------------------------------------------------
+        # Step4️⃣ 计算 Query
+        # 式(QD): c_t^{Q} = W^{DQ} h_t
+        # 式(QU): q_t^{C} = W^{UQ} c_t^{Q}
+        # 式(R):  q_t^{R} = RoPE(q_{raw,t}^{R})
+        # -----------------------------------------------------
+        compressed_q = x @ self.W_dq                                                    # 式(QD): 计算低秩压缩向量 c_t^{Q}
+        compressed_q = self.q_layernorm(compressed_q)                                   # ˆc_t^{Q}
+        Q = compressed_q @ self.W_uq                                                    # 式(QU): 计算恢复向量 q_t^{C}
+        Q = Q.view(B, -1, self.n_heads, self.dh).transpose(1, 2)                        # [B,nH,S,dh]
+        Q, Q_for_rope = torch.split(Q, [self.qk_nope_dim, self.qk_rope_dim], dim=-1)    # 拆分 q_t^{C}, q_t^{R}
+        cos_q = self.cos_cached[:, :, past_length:past_length + S, :self.qk_rope_dim // 2].repeat(1, 1, 1, 2)
+        sin_q = self.sin_cached[:, :, past_length:past_length + S, :self.qk_rope_dim // 2].repeat(1, 1, 1, 2)
+        Q_for_rope = apply_rope_x(Q_for_rope, cos_q, sin_q)                             # q_t^{R} = RoPE(q_{raw,t}^{R})
 
-        if casual_mask is not None:
-            scores = scores.masked_fill(casual_mask == 0, float('-inf'))
-        
-        attn_weights = F.softmax(scores, dim=-1).to(query_states.dtype)
-        attn_weights = F.dropout(
-            attn_weights, p=self.attention_dropout, training=self.training
-        ) # attn_weights shape: [bs, num_heads, seq_len, seq_len]
-        
-        attn_output = torch.matmul(attn_weights, value_states) # shape: [bs, num_heads, seq_len, head_dim]
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, q_len, self.num_heads * self.v_head_dim)
+        # -----------------------------------------------------
+        # Step5️⃣ 拼接解耦分支
+        # 式: q_t = [q_t^{C}; q_t^{R}],  k_j = [k_j^{C}; k_j^{R}],  v_j = v_j^{C}
+        # -----------------------------------------------------
+        q_heads = torch.cat([Q, Q_for_rope], dim=-1)                                    # 拼接得到完整 q_t
+        k_heads = torch.cat([K, K_for_rope], dim=-1)                                    # 拼接得到完整 k_j
+        v_heads = V                                                                     # v_j 不变
 
-        # 5, MLA 输出映射
-        output = self.o_proj(attn_output)
+        # -----------------------------------------------------
+        # Step6️⃣ 注意力计算
+        # 式(A): α_{t,j} = softmax_j( (q_t k_j^T)/√d )
+        # 式(O): o_t = Σ_j α_{t,j} v_j
+        # -----------------------------------------------------
+        mask = torch.ones((S, S_full), device=x.device)                                 # 构造因果mask
+        mask = torch.tril(mask, diagonal=past_length)
+        sq_mask = mask[None, None, :, :] == 1
+        x_out = F.scaled_dot_product_attention(q_heads, k_heads, v_heads, attn_mask=sq_mask)  # o_t = Σ α_{t,j} v_j
+        x_out = x_out.transpose(1, 2).reshape(B, S, D)                                  # 合并所有head输出
+        x_out = x_out @ self.W_o.T                                                      # 式(U): u_t = W^{O} o_t
 
-        return output, attn_weights
+        return x_out, compressed_kv
+
+
+# =========================================================
+# 🔹 调试入口
+# =========================================================
+def main():
+    torch.manual_seed(42)
+    d_model, n_heads, seq_len, batch = 256, 8, 8, 2
+    model = MLA(d_model=d_model, n_heads=n_heads, max_len=128)
+    x = torch.randn(batch, seq_len, d_model)
+    out, kv = model(x)
+    print(f"✅ 输入: {x.shape} → 输出: {out.shape}, 缓存: {kv.shape}")
+
+if __name__ == "__main__":
+    main()

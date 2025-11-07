@@ -72,11 +72,14 @@ def apply_rotary_emb(xq, xk, freqs_cis):
     # (1) 将实数对 [q_{2i}, q_{2i+1}] 转为复数 q_i = q_{2i} + i·q_{2i+1}
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    
     # (2) 对齐广播形状
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    
     # (3) 复数乘法实现旋转: q'_m = q_m × e^{i m θ}
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+
     # (4) 转回原始类型
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
@@ -89,7 +92,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
 
     # 模拟输入：batch=1, seq_len=4, num_heads=1, head_dim=8
-    B, L, H, D = 1, 4, 1, 8
+    B, L, H, D = 1, 128, 64, 128
     xq = torch.randn(B, L, H, D)
     xk = torch.randn(B, L, H, D)
 
